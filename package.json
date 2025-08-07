@@ -1,0 +1,12 @@
+{
+  "name": "puente-api-id-rdalmacen",
+  "version": "1.0.0",
+  "description": "Puente API para ID de almacén",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
