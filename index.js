@@ -1,14 +1,13 @@
 // index.js
 import express from "express";
-import fetch from "node-fetch"; // o axios
 import cors from "cors";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// URL de tu Web App (Apps Script) desplegada como "Cualquiera con el enlace"
-const GAS_URL = process.env.GAS_URL; // << PON esto en variables de entorno en Render
+// Pon este valor en Environment → Environment Variables en Render
+const GAS_URL = process.env.GAS_URL;
 
 app.post("/login", async (req, res) => {
   try {
