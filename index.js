@@ -1,108 +1,151 @@
 // index.js
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import bcrypt from "bcryptjs";
 
-// ========= Config básica =========
+// ====== Config ======
 const app = express();
+app.use(helmet());
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "50kb" }));
 
-const GAS_URL = process.env.GAS_URL; // <-- define esto en Render (Environment → Environment Variables)
-if (!GAS_URL) {
-  console.warn(
-    "[WARN] Falta GAS_URL. Configúrala en variables de entorno. El servidor responderá 500 en rutas de API."
-  );
-}
+const GAS_URL         = process.env.GAS_URL;                 // URL /exec del GAS
+const PEPPER          = process.env.PEPPER || "";            // pimienta global
+const SA_USER         = process.env.SUPERADMIN_USER || "";   // superusuario
+const SA_HASH         = process.env.SUPERADMIN_HASH || "";   // bcrypt hash (de "clave + PEPPER")
+const PORT            = process.env.PORT || 10000;
 
-// Helper para reenviar al Apps Script con timeout y buen manejo de errores
-async function forwardToGAS(payload) {
-  if (!GAS_URL) {
-    return { status: 500, body: { success: false, message: "GAS_URL no configurada" } };
-  }
+if (!GAS_URL) console.warn("[WARN] Falta GAS_URL");
+if (!SA_USER || !SA_HASH) console.warn("[WARN] Superadmin no configurado (SUPERADMIN_USER/HASH)");
+
+// ====== Helpers ======
+async function callGAS(payload){
+  if (!GAS_URL) throw new Error("GAS_URL no configurada");
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000); // 20s
-  try {
+  const timer = setTimeout(()=>controller.abort(), 20000);
+  try{
     const r = await fetch(GAS_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type":"application/json" },
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
-    clearTimeout(timeout);
-
-    const text = await r.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      // GAS debería devolver JSON; si no, devolvemos el texto crudo para depurar
-      data = { success: false, message: "Respuesta no-JSON desde GAS", raw: text };
-    }
-    return { status: r.ok ? 200 : r.status, body: data };
-  } catch (e) {
-    clearTimeout(timeout);
-    const msg = e?.name === "AbortError" ? "Timeout al contactar GAS" : String(e);
-    return { status: 500, body: { success: false, message: msg } };
-  }
+    const txt = await r.text();
+    let json; try{ json = JSON.parse(txt); }catch{ json = { success:false, message:"Respuesta no-JSON", raw:txt }; }
+    return json;
+  } finally { clearTimeout(timer); }
 }
 
-// ========= Rutas =========
+// Limites
+const loginLimiter = rateLimit({ windowMs: 15*60*1000, max: 100 });   // 100 intentos/15min por IP
+const registerLimiter = rateLimit({ windowMs: 15*60*1000, max: 50 });
 
-// Salud
-app.get("/", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "puente_API_ID_rdAlmacen",
-    gasConfigured: Boolean(GAS_URL),
-  });
+// ====== Rutas ======
+app.get("/", (req,res)=> {
+  res.json({ ok:true, service:"puente-api-id-rdalmacen", gasConfigured: !!GAS_URL });
 });
 
-// ¿_usuarios está vacía?
-app.post("/check", async (_req, res) => {
-  const out = await forwardToGAS({ action: "check_empty" });
-  res.status(out.status).json(out.body);
+// ¿Vacío?
+app.post("/check", async (req,res)=>{
+  try { res.json(await callGAS({ action:"check_empty" })); }
+  catch(e){ res.status(500).json({ success:false, message:String(e) }); }
 });
 
-// Login normal
-app.post("/login", async (req, res) => {
-  const { usuario, clave, pc_origen } = req.body || {};
-  const out = await forwardToGAS({ action: "login", usuario, clave, pc_origen });
-  res.status(out.status).json(out.body);
+// Login seguro (Node compara bcrypt; GAS solo persiste)
+app.post("/login", loginLimiter, async (req,res)=>{
+  try{
+    const { usuario, clave, pc_origen } = req.body || {};
+    if (!usuario || !clave) return res.json({ success:false, message:"Usuario y clave requeridos" });
+
+    // 1) Superadmin local (no usa GAS)
+    if (SA_USER && SA_HASH && usuario === SA_USER) {
+      const ok = await bcrypt.compare(String(clave) + PEPPER, SA_HASH);
+      if (!ok) return res.json({ success:false, message:"Credenciales inválidas" });
+      return res.json({ success:true, usuario: SA_USER, nombre:"Super Admin", rol:"super" });
+    }
+
+    // 2) Usuarios en GAS
+    const resp = await callGAS({ action:"user_get", usuario });
+    if (!resp.success || !resp.user) return res.json({ success:false, message:"Usuario no encontrado" });
+
+    const u = resp.user;
+    if (String(u.activo).toUpperCase() !== "SI") return res.json({ success:false, message:"Usuario inactivo" });
+    if (!u.clave_hash) return res.json({ success:false, message:"Usuario sin clave configurada" });
+
+    const ok = await bcrypt.compare(String(clave) + PEPPER, String(u.clave_hash));
+    if (!ok) return res.json({ success:false, message:"Credenciales inválidas" });
+
+    // 3) Touch login
+    await callGAS({ action:"user_touch_login", usuario, pc_origen });
+
+    res.json({ success:true, usuario, nombre: u.nombre || "", rol: u.rol || "user" });
+  }catch(e){
+    res.status(500).json({ success:false, message:String(e) });
+  }
 });
 
-// Registro
-app.post("/register", async (req, res) => {
-  const { usuario, clave, nombre, apellido_pat, respuesta, pc_origen, rol } = req.body || {};
-  const out = await forwardToGAS({
-    action: "register",
-    usuario,
-    clave,
-    nombre,
-    apellido_pat,
-    respuesta,
-    pc_origen,
-    rol,
-  });
-  res.status(out.status).json(out.body);
+// Registrar (Node hashea y manda clave_hash)
+app.post("/register", registerLimiter, async (req,res)=>{
+  try{
+    const { usuario, clave, nombre, apellido_pat, pc_origen, rol="user", respuesta } = req.body || {};
+    if (!usuario || !clave || !nombre) return res.json({ success:false, message:"usuario, clave y nombre son requeridos" });
+
+    const clave_hash = await bcrypt.hash(String(clave) + PEPPER, 12);
+    const payload = {
+      action:"user_create",
+      usuario, clave_hash, nombre,
+      apellido_pat: apellido_pat || "",
+      pc_origen: pc_origen || "",
+      rol,
+      // si quieres guardar respuesta de recuperación, mándala ya hasheada aquí:
+      // respuesta_hash: await bcrypt.hash(String(respuesta) + PEPPER, 12)
+    };
+    const out = await callGAS(payload);
+    res.json(out);
+  }catch(e){
+    res.status(500).json({ success:false, message:String(e) });
+  }
 });
 
-// Eliminar (o deshabilitar según tu GAS; aquí lo borra)
-app.post("/delete", async (req, res) => {
-  const { usuario } = req.body || {};
-  const out = await forwardToGAS({ action: "delete", usuario });
-  res.status(out.status).json(out.body);
+// Deshabilitar usuario (soft delete)
+app.post("/delete", async (req,res)=>{
+  try{
+    const { usuario } = req.body || {};
+    if (!usuario) return res.json({ success:false, message:"usuario requerido" });
+    const out = await callGAS({ action:"user_disable", usuario });
+    res.json(out);
+  }catch(e){
+    res.status(500).json({ success:false, message:String(e) });
+  }
 });
 
-// Login con Google (recibe id_token del cliente)
-app.post("/google_login", async (req, res) => {
-  const { id_token } = req.body || {};
-  const out = await forwardToGAS({ action: "google_login", id_token });
-  res.status(out.status).json(out.body);
+// (Opcional) Bootstrap admin si está vacío (ejecútalo 1 vez desde Postman/PowerShell)
+app.post("/bootstrap_admin", async (req,res)=>{
+  try{
+    if (!SA_USER || !SA_HASH) return res.json({ success:false, message:"Superadmin no configurado" });
+    const chk = await callGAS({ action:"check_empty" });
+    if (!chk.success) return res.json(chk);
+    if (!chk.empty)  return res.json({ success:true, message:"Ya existen usuarios. No se crea admin." });
+
+    const out = await callGAS({
+      action:"user_create",
+      usuario: SA_USER,
+      clave_hash: SA_HASH,
+      nombre: "Administrador",
+      apellido_pat: "",
+      pc_origen: "bootstrap",
+      rol: "admin"
+    });
+    res.json(out);
+  }catch(e){
+    res.status(500).json({ success:false, message:String(e) });
+  }
 });
 
-// ========= Arranque =========
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`[OK] Servicio activo en puerto ${PORT}`);
-  console.log(`[INFO] GAS_URL configurada: ${GAS_URL ? "sí" : "no"}`);
+// ====== Start ======
+app.listen(PORT, ()=> {
+  console.log(`[OK] Servicio en puerto ${PORT}`);
+  console.log(`[INFO] GAS_URL: ${GAS_URL ? "OK" : "FALTA"}`);
 });
